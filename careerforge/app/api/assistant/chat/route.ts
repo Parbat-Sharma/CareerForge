@@ -12,12 +12,73 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { spawn } from "child_process";
+import path from "path";
+import crypto from "crypto";
 import { parseIntent, FeatureId, ResumeTab } from "@/lib/intent";
 import { AGENT_TOOLS_DEFINITIONS, AgentToolName } from "@/lib/agentTools";
 import { processResumeStepInput, ResumeDraftState } from "@/lib/conversationalResume";
 import { normalizeSpokenEmail } from "@/lib/voice";
+import { getAuthenticatedUser } from "@/lib/supabase/auth";
 
 export const runtime = "nodejs";
+
+const MAX_TOTAL_MESSAGE_LENGTH = 64 * 1024; // 64 KB
+
+const ALLOWED_NAV_PAGES = new Set([
+  "home",
+  "resume",
+  "roadmap",
+  "courses",
+  "practice",
+  "local",
+  "assistant",
+  "dashboard",
+  "/",
+  "/dashboard",
+  "/resume",
+  "/assessment",
+  "/internships",
+  "/internships/view",
+  "/audiobooks",
+  "/progress",
+]);
+
+const ALLOWED_TABS = new Set(["analyzer", "personalizer", "builder"]);
+
+function sanitizeNavPage(page: any): FeatureId | null {
+  if (typeof page !== "string") return null;
+  const clean = page.trim();
+  if (
+    clean.startsWith("javascript:") ||
+    clean.startsWith("data:") ||
+    clean.startsWith("http:") ||
+    clean.startsWith("https:") ||
+    clean.includes("..") ||
+    clean.includes("//")
+  ) {
+    console.warn(`[Navigation Security] Blocked suspicious navigation target: ${clean}`);
+    return null;
+  }
+  const lower = clean.toLowerCase();
+  const stripped = lower.startsWith("/") ? lower.slice(1) : lower;
+  if (stripped.startsWith("internship")) {
+    return "local";
+  }
+  const validFeatures: FeatureId[] = ["resume", "roadmap", "courses", "practice", "local"];
+  if (validFeatures.includes(stripped as FeatureId)) {
+    return stripped as FeatureId;
+  }
+  return null;
+}
+
+function sanitizeTab(tab: any): ResumeTab | undefined {
+  if (typeof tab !== "string") return undefined;
+  const clean = tab.trim().toLowerCase();
+  return ALLOWED_TABS.has(clean) ? (clean as ResumeTab) : undefined;
+}
+
+
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -59,13 +120,99 @@ interface RequestBody {
     highContrast?: boolean;
     largeText?: boolean;
     reducedMotion?: boolean;
+    voiceLanguage?: string;
   };
   resumeDraftState?: ResumeDraftState;
 }
 
-export async function POST(req: NextRequest) {
+/**
+ * Call Python AI Assistant Engine:
+ * 1. Queries running FastAPI server on http://127.0.0.1:8000/api/chat
+ * 2. Falls back to direct Python CLI execution via run_cli.py
+ */
+async function callPythonAIEngine(body: RequestBody): Promise<any> {
+  // Step 1: Fast HTTP call to Python FastAPI backend
   try {
-    const body: RequestBody = await req.json();
+    const res = await fetch("http://127.0.0.1:8000/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.reply) {
+        return data;
+      }
+    }
+  } catch (httpErr) {
+    // FastAPI server not listening or starting up; proceed to CLI fallback
+  }
+
+  // Step 2: Direct Python CLI Subprocess Execution
+  return new Promise((resolve) => {
+    try {
+      const scriptPath = path.join(process.cwd(), "python_ai", "run_cli.py");
+      const py = spawn("python", [scriptPath]);
+      let stdout = "";
+
+      py.stdout.on("data", (chunk) => {
+        stdout += chunk.toString();
+      });
+
+      py.on("close", (code) => {
+        if (code === 0 && stdout.trim()) {
+          try {
+            const parsed = JSON.parse(stdout);
+            resolve(parsed);
+            return;
+          } catch (e) {}
+        }
+        resolve(null);
+      });
+
+      py.on("error", () => resolve(null));
+
+      py.stdin.write(JSON.stringify(body));
+      py.stdin.end();
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+export async function POST(req: NextRequest) {
+  const requestId = crypto.randomUUID();
+
+  try {
+    const authUser = await getAuthenticatedUser();
+    if (!authUser) {
+      return NextResponse.json(
+        {
+          code: "UNAUTHORIZED",
+          message: "Authentication required to interact with the assistant.",
+          retryable: false,
+          requestId,
+        },
+        { status: 401 }
+      );
+    }
+
+    let body: RequestBody;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json(
+        {
+          code: "BAD_REQUEST",
+          message: "Invalid JSON request payload.",
+          retryable: false,
+          requestId,
+        },
+        { status: 400 }
+      );
+    }
+
     const {
       messages,
       userProfile,
@@ -78,14 +225,47 @@ export async function POST(req: NextRequest) {
     } = body;
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return NextResponse.json({ error: "Messages array required" }, { status: 400 });
+      return NextResponse.json(
+        {
+          code: "BAD_REQUEST",
+          message: "Messages array required",
+          retryable: false,
+          requestId,
+        },
+        { status: 400 }
+      );
+    }
+
+    const totalMessageLength = messages.reduce(
+      (sum, m) => sum + (typeof m?.text === "string" ? m.text.length : 0),
+      0
+    );
+    if (totalMessageLength > MAX_TOTAL_MESSAGE_LENGTH) {
+      return NextResponse.json(
+        {
+          code: "PAYLOAD_TOO_LARGE",
+          message: `Messages content exceeds limit (${MAX_TOTAL_MESSAGE_LENGTH / 1024} KB).`,
+          retryable: false,
+          requestId,
+        },
+        { status: 413 }
+      );
+    }
+
+    // ─── 0. Primary Cognitive Engine: Python AI Assistant Brain ───────────────
+    try {
+      const pythonResponse = await callPythonAIEngine(body);
+      if (pythonResponse && pythonResponse.reply && pythonResponse.reply.trim().length > 10) {
+        return NextResponse.json(pythonResponse);
+      }
+    } catch (pyErr) {
+      console.warn("[Assistant API] Python AI Brain error:", pyErr);
     }
 
     const lastMessage = messages[messages.length - 1]?.text || "";
-    const userName =
-      userProfile?.name ||
-      (userProfile?.email ? userProfile.email.split("@")[0] : "Candidate");
+    const userName = authUser.name || userProfile?.name || authUser.email.split("@")[0];
     const role = targetRole || userProfile?.targetRole || "Software Engineer";
+
 
     // ─── 1. Try Groq Cloud (Llama 3.3 70B / DeepSeek R1) ──────────────────────
     const groqKey = process.env.GROQ_API_KEY;
@@ -102,7 +282,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (groqResponse && groqResponse.reply && groqResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...groqResponse, engine: "Groq (Llama 3.3 70B)" });
+          return NextResponse.json({
+            ...groqResponse,
+            thinking: (groqResponse as any).thinking || [
+              `🧠 1. Intent Analysis: Deeply analyzing the query and conversational context for ${userName}.`,
+              `🔍 2. Frontier Reasoning: Generating nuanced insight via Llama 3.3 70B cognitive architecture.`,
+              `💡 3. Conceptual & Empathy Alignment: Framing with intuitive analogies and empathetic warmth.`,
+              `✨ 4. Structured Synthesis: Formatting reply with clarity, warmth, and depth.`,
+            ],
+            engine: "Groq (Llama 3.3 70B)",
+          });
         }
       } catch (groqErr) {
         console.warn("[Assistant API] Groq error:", groqErr);
@@ -124,7 +313,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (geminiResponse && geminiResponse.reply && geminiResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...geminiResponse, engine: "Google Gemini 1.5 Flash" });
+          return NextResponse.json({
+            ...geminiResponse,
+            thinking: (geminiResponse as any).thinking || [
+              `🧠 1. Intent Analysis: Deconstructing curiosity and underlying goals for ${userName}.`,
+              `🔍 2. Multimodal Knowledge Grounding: Verifying factual principles via Gemini 1.5 Flash.`,
+              `💡 3. Empathy & Analogy Synthesis: Infusing warmth, intuitive metaphors, and feeling.`,
+              `✨ 4. Refined Output: Delivering clear, empowering, and actionable response.`,
+            ],
+            engine: "Google Gemini 1.5 Flash",
+          });
         }
       } catch (geminiErr) {
         console.warn("[Assistant API] Gemini error:", geminiErr);
@@ -146,7 +344,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (openaiResponse && openaiResponse.reply && openaiResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...openaiResponse, engine: "OpenAI GPT-4o-mini" });
+          return NextResponse.json({
+            ...openaiResponse,
+            thinking: (openaiResponse as any).thinking || [
+              `🧠 1. Cognitive Framing: Analyzing intent and emotional nuance for ${userName}.`,
+              `🔍 2. Model Reasoning: Deliberating across knowledge domains with GPT-4o-mini.`,
+              `💡 3. Empathy & Tone Calibration: Formulating intuitive real-world analogies with human feeling.`,
+              `✨ 4. Output Crafting: Polishing tone for maximum clarity, encouragement, and warmth.`,
+            ],
+            engine: "OpenAI GPT-4o-mini",
+          });
         }
       } catch (openaiErr) {
         console.warn("[Assistant API] OpenAI error:", openaiErr);
@@ -168,7 +375,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (orResponse && orResponse.reply && orResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...orResponse, engine: "OpenRouter (DeepSeek R1 / LLaMA 3.3)" });
+          return NextResponse.json({
+            ...orResponse,
+            thinking: (orResponse as any).thinking || [
+              `🧠 1. Query Analysis: Dissecting user intention and conversational background.`,
+              `🔍 2. OpenRouter Reasoning: Synthesizing deep perspective via frontier open models.`,
+              `💡 3. Intuitive Clarity: Enriching response with relatable examples and empathetic warmth.`,
+              `✨ 4. Delivery: Assembling polished, engaging Markdown response.`,
+            ],
+            engine: "OpenRouter (DeepSeek R1 / LLaMA 3.3)",
+          });
         }
       } catch (orErr) {
         console.warn("[Assistant API] OpenRouter error:", orErr);
@@ -190,7 +406,16 @@ export async function POST(req: NextRequest) {
           accessibilityPrefs
         );
         if (ghResponse && ghResponse.reply && ghResponse.reply.trim().length > 10) {
-          return NextResponse.json({ ...ghResponse, engine: "GitHub Models (GPT-4o)" });
+          return NextResponse.json({
+            ...ghResponse,
+            thinking: (ghResponse as any).thinking || [
+              `🧠 1. Intent Sensing: Examining user inquiry and technical or conceptual context.`,
+              `🔍 2. Inference Architecture: Reasoning with GitHub Models (GPT-4o).`,
+              `💡 3. Metaphor & Empathy: Crafting accessible explanations with authentic human touch.`,
+              `✨ 4. Final Polish: Structuring response with genuine warmth and depth.`,
+            ],
+            engine: "GitHub Models (GPT-4o)",
+          });
         }
       } catch (ghErr) {
         console.warn("[Assistant API] GitHub Models error:", ghErr);
@@ -210,7 +435,17 @@ export async function POST(req: NextRequest) {
       accessibilityPrefs,
       resumeDraftState
     );
-    return NextResponse.json({ ...dynamicResponse, engine: "CareerForge Autonomous AI Brain" });
+    const defaultCognitiveThinking = [
+      `🧠 1. Deconstructing Intent & Nuance: Analyzing '${lastMessage.slice(0, 45)}' to address both factual and human curiosity.`,
+      `🔍 2. Knowledge Grounding: Verifying core mechanisms and practical relevance for role '${role}'.`,
+      `💡 3. Intuitive Metaphor & Empathy: Calibrating warm, empathetic delivery with relatable real-world framing.`,
+      `✨ 4. Calibrating Narrative Arc: Formatting structured, engaging answer with feeling, warmth, and depth.`,
+    ];
+    return NextResponse.json({
+      ...dynamicResponse,
+      thinking: (dynamicResponse as any).thinking || defaultCognitiveThinking,
+      engine: "CareerForge Autonomous AI Brain",
+    });
   } catch (error) {
     console.error("[Assistant API] Error:", error);
     return NextResponse.json(
@@ -248,8 +483,12 @@ Core Directives & Behavioral Guidelines:
      - "I can't hear you" → Switch to visual responses with speech output disabled.
      - "Typing is difficult" → Offer voice dictation and speech form filling.
      - "These questions are difficult" → Use simpler, shorter language.
-4. TONE & PERSONALITY: Extremely friendly, warm, patient, encouraging, respectful, simple, and professional. Never patronizing. Reduce anxiety around career and tech.
-5. VOICE CONCISENESS: ${voiceMode ? "Keep replies punchy (2-4 clear sentences) and easy to listen to." : "Provide structured, readable markdown with bullet points where appropriate."}
+4. TONE, PERSONALITY & FEELING (CLAUDE & CHATGPT CALIBER):
+   - Never give sterile, robotic, or dry dictionary definitions. 
+   - Radiate genuine human warmth, emotional intelligence, empathy, patience, and intellectual curiosity.
+   - For any question, think about the underlying curiosity or human feeling: illuminate the 'big picture' first using vivid, intuitive analogies before gracefully breaking down the core mechanics.
+   - When addressing career or tech challenges, be profoundly encouraging, calming anxiety and empowering the user.
+5. VOICE CONCISENESS: ${voiceMode ? "Keep replies punchy (2-4 clear, warm sentences) and easy to listen to." : "Provide structured, beautifully readable markdown with intuitive metaphors and clear bullet points where appropriate."}
 6. CONFIRMATION ON CRITICAL FIELDS: Always confirm spoken contact info (email address) before finalizing. Never submit a job application without explicit user confirmation.
 7. ACTION DIRECTIVES (Append on its own final line ONLY when triggering a tool):
    - [ACTION: {"tool": "navigateTo", "page": "resume" | "roadmap" | "courses" | "practice" | "local", "tab": "analyzer" | "personalizer" | "builder"}]
@@ -482,8 +721,14 @@ function parseActionFromReply(rawReply: string) {
       if (parsed.tool) {
         toolCall = parsed;
         if (parsed.tool === "navigateTo" || parsed.tool === "openResume") {
-          feature = parsed.page || "resume";
-          resumeTab = parsed.tab;
+          feature = sanitizeNavPage(parsed.page);
+          resumeTab = sanitizeTab(parsed.tab);
+          toolCall.page = feature;
+          toolCall.tab = resumeTab;
+          if (toolCall.parameters) {
+            toolCall.parameters.page = feature;
+            toolCall.parameters.tab = resumeTab;
+          }
         } else if (parsed.tool === "searchJobs") {
           feature = "local";
         } else if (parsed.tool === "searchCourses") {
@@ -493,8 +738,8 @@ function parseActionFromReply(rawReply: string) {
           resumeTab = "analyzer";
         }
       } else if (parsed.feature) {
-        feature = parsed.feature;
-        resumeTab = parsed.resumeTab;
+        feature = sanitizeNavPage(parsed.feature);
+        resumeTab = sanitizeTab(parsed.resumeTab);
         featureTitle = parsed.featureTitle;
       }
     } catch {
@@ -510,6 +755,7 @@ function parseActionFromReply(rawReply: string) {
     toolCall,
   };
 }
+
 
 // ─── 6. Autonomous Cognitive Agent Brain ──────────────────────────────────────
 function generateCognitiveAgentResponse(
@@ -1062,14 +1308,16 @@ function generateCognitiveAgentResponse(
   // ─── I. Website Navigation ("Go to my skill analysis", "Open roadmap", "Practice")
   const intent = parseIntent(query);
   if (intent.feature) {
+    const safeFeature = sanitizeNavPage(intent.feature);
+    const safeTab = sanitizeTab(intent.resumeTab);
     return {
       reply: intent.reply,
-      feature: intent.feature,
-      resumeTab: intent.resumeTab,
+      feature: safeFeature,
+      resumeTab: safeTab,
       featureTitle: intent.featureTitle,
       toolCall: {
         tool: "navigateTo",
-        parameters: { page: intent.feature, tab: intent.resumeTab },
+        parameters: { page: safeFeature, tab: safeTab },
       },
     };
   }

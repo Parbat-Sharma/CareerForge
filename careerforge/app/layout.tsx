@@ -4,6 +4,7 @@ import "./globals.css";
 import { AppProvider } from "@/lib/store";
 import { GlobalVoiceDictator } from "@/components/accessibility/GlobalVoiceDictator";
 import { GlobalVoiceProvider } from "@/providers/GlobalVoiceProvider";
+import { VoiceProvider } from "@/context/VoiceContext";
 
 const display = Newsreader({
   subsets: ["latin"],
@@ -36,8 +37,22 @@ export default function RootLayout({
       <body className="font-body antialiased">
         <AppProvider>
           <GlobalVoiceProvider>
-            {children}
-            <GlobalVoiceDictator />
+            <VoiceProvider>
+              <a
+                href="#main-content"
+                className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-md focus:bg-black focus:px-4 focus:py-3 focus:text-white"
+              >
+                Skip to main content
+              </a>
+              <a
+                href="#voice-assistant-controls"
+                className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-20 focus:z-[100] focus:rounded-md focus:bg-black focus:px-4 focus:py-3 focus:text-white"
+              >
+                Skip to voice assistant controls
+              </a>
+              {children}
+              <GlobalVoiceDictator />
+            </VoiceProvider>
           </GlobalVoiceProvider>
         </AppProvider>
       </body>

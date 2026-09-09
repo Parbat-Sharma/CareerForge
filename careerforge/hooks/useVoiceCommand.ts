@@ -16,8 +16,8 @@
  * so every tab/component can react to the same listening + fallback state.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { isAIAudioPlaying } from "@/lib/voice";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { isAIAudioPlaying, isCommandBarActive, subscribeCommandBar } from "@/lib/voice";
 
 // ---------------------------------------------------------------------------
 // Minimal Web Speech API typings (not consistently shipped in lib.dom.d.ts)
@@ -109,6 +109,12 @@ export interface UseVoiceCommandOptions {
   onSpeechDetected?: () => void;
   /** Whether the hook should actively try to keep the mic listening. */
   enabled?: boolean;
+  /**
+   * Marks this instance as the user-controlled command bar. It keeps the mic
+   * even when `setCommandBarActive(true)` parks every other recognizer; other
+   * instances (probe, dictator) should leave this `false`.
+   */
+  ownsCommandBar?: boolean;
 }
 
 export interface UseVoiceCommandReturn {
@@ -124,13 +130,39 @@ export interface UseVoiceCommandReturn {
   start: () => void;
   stop: () => void;
   resetStrikes: () => void;
+  clearTranscript: () => void;
 }
 
 export function useVoiceCommand(
   options: UseVoiceCommandOptions = {}
 ): UseVoiceCommandReturn {
-  const { lang = "en-US", onFallbackTriggered, onResult, onSpeechDetected, enabled = true } =
-    options;
+  const {
+    lang = "en-US",
+    onFallbackTriggered,
+    onResult,
+    onSpeechDetected,
+    enabled = true,
+    ownsCommandBar = false,
+  } = options;
+
+  // Stale callback avoidance: bind to latest refs
+  const onResultRef = useRef(onResult);
+  onResultRef.current = onResult;
+  const onFallbackTriggeredRef = useRef(onFallbackTriggered);
+  onFallbackTriggeredRef.current = onFallbackTriggered;
+  const onSpeechDetectedRef = useRef(onSpeechDetected);
+  onSpeechDetectedRef.current = onSpeechDetected;
+
+  // Park this recognizer while the command bar owns the mic (unless we *are* it).
+  const commandBarActive = useSyncExternalStore(
+    subscribeCommandBar,
+    isCommandBarActive,
+    () => false
+  );
+  const parked = !ownsCommandBar && commandBarActive;
+  const parkedRef = useRef(parked);
+  parkedRef.current = parked;
+  const wasParkedRef = useRef(false);
 
   const [isSupported, setIsSupported] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -153,15 +185,30 @@ export function useVoiceCommand(
    * silence. Reset once per listening cycle, in `onstart`.
    */
   const strikeRegisteredThisCycleRef = useRef(false);
+  const recoveryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const triggerFallback = useCallback(() => {
     if (fallbackFiredRef.current) return;
     fallbackFiredRef.current = true;
-    intentionalStopRef.current = true;
-    recognitionRef.current?.stop();
+    try {
+      recognitionRef.current?.stop();
+    } catch {}
     setIsListening(false);
-    onFallbackTriggered?.();
-  }, [onFallbackTriggered]);
+    onFallbackTriggeredRef.current?.();
+
+    // Controlled persistent recovery: do not permanently kill the listener on silence strikes!
+    if (recoveryTimeoutRef.current) clearTimeout(recoveryTimeoutRef.current);
+    recoveryTimeoutRef.current = setTimeout(() => {
+      fallbackFiredRef.current = false;
+      strikesRef.current = 0;
+      setStrikes(0);
+      if (!intentionalStopRef.current && !parkedRef.current) {
+        try {
+          recognitionRef.current?.start();
+        } catch {}
+      }
+    }, 2500);
+  }, []);
 
   const registerStrike = useCallback(() => {
     strikesRef.current += 1;
@@ -172,9 +219,15 @@ export function useVoiceCommand(
   }, [triggerFallback]);
 
   const resetStrikes = useCallback(() => {
+    if (recoveryTimeoutRef.current) clearTimeout(recoveryTimeoutRef.current);
     strikesRef.current = 0;
     fallbackFiredRef.current = false;
     setStrikes(0);
+  }, []);
+
+  const clearTranscript = useCallback(() => {
+    setTranscript("");
+    setInterimTranscript("");
   }, []);
 
   const buildRecognition = useCallback((): SpeechRecognitionLike | null => {
@@ -199,13 +252,23 @@ export function useVoiceCommand(
     };
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
+      // Debug: trace exactly what the speech engine emits, before any guard drops it.
+      const latest = event.results[event.results.length - 1];
+      console.log(
+        "[useVoiceCommand] onresult:",
+        JSON.stringify(latest?.[0]?.transcript ?? ""),
+        `final=${latest?.isFinal ?? false}`,
+        `aiAudioPlaying=${isAIAudioPlaying()}`,
+        `parked=${parkedRef.current}`
+      );
+
       // Ignore microphone input while AI audio or speech synthesis is playing
       if (isAIAudioPlaying()) {
         return;
       }
 
       if (!heardSpeechSinceStartRef.current) {
-        onSpeechDetected?.();
+        onSpeechDetectedRef.current?.();
       }
       heardSpeechSinceStartRef.current = true;
       // A successful result resets the strike streak — failures must be
@@ -223,8 +286,12 @@ export function useVoiceCommand(
         }
       }
       if (finalChunk) {
-        setTranscript((prev) => `${prev} ${finalChunk}`.trim());
-        onResult?.(finalChunk.trim());
+        const cleanChunk = finalChunk.trim();
+        setTranscript((prev) => {
+          const combined = `${prev} ${cleanChunk}`.trim();
+          return combined.length > 500 ? combined.slice(-500).trim() : combined;
+        });
+        onResultRef.current?.(cleanChunk);
       }
       setInterimTranscript(interimChunk);
     };
@@ -253,7 +320,7 @@ export function useVoiceCommand(
         return;
       }
 
-      if (fallbackFiredRef.current || !enabled) return;
+      if (fallbackFiredRef.current || !enabled || parkedRef.current) return;
 
       // Recognition ended without us asking it to. If it ended having heard
       // nothing at all in this session, that's silence — count it as a
@@ -276,15 +343,18 @@ export function useVoiceCommand(
   }, [
     enabled,
     lang,
-    onResult,
-    onSpeechDetected,
     registerStrike,
     resetStrikes,
     triggerFallback,
   ]);
 
   const start = useCallback(() => {
-    if (!enabled || fallbackFiredRef.current) return;
+    // Silence fallback must not permanently disable the session listener
+    fallbackFiredRef.current = false;
+    strikesRef.current = 0;
+    setStrikes(0);
+
+    if (!enabled || parkedRef.current) return;
     const Ctor = resolveSpeechRecognitionCtor();
     if (!Ctor) {
       setIsSupported(false);
@@ -332,7 +402,7 @@ export function useVoiceCommand(
         recognitionRef.current?.stop();
         setIsListening(false);
       } else {
-        if (enabled && !fallbackFiredRef.current) {
+        if (enabled && !fallbackFiredRef.current && !parkedRef.current) {
           intentionalStopRef.current = false;
           try {
             recognitionRef.current?.start();
@@ -349,6 +419,20 @@ export function useVoiceCommand(
     };
   }, [enabled]);
 
+  // Stop when the command bar takes the mic; resume once it releases — but only
+  // if we were actually parked, so this never auto-starts a fresh instance.
+  useEffect(() => {
+    if (parked) {
+      wasParkedRef.current = true;
+      intentionalStopRef.current = true;
+      recognitionRef.current?.stop();
+      setIsListening(false);
+    } else if (wasParkedRef.current) {
+      wasParkedRef.current = false;
+      if (enabled && !fallbackFiredRef.current) start();
+    }
+  }, [parked, enabled, start]);
+
   return {
     isSupported,
     isListening,
@@ -361,5 +445,6 @@ export function useVoiceCommand(
     start,
     stop,
     resetStrikes,
+    clearTranscript,
   };
 }

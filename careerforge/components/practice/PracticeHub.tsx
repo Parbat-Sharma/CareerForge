@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import { useApp } from "@/lib/store";
 import { Section } from "@/components/ui/Section";
@@ -415,6 +415,58 @@ export function PracticeHub() {
       speechControllerRef.current?.stop();
     };
   }, []);
+
+  // ─── Assessment Doubt Handling (Section 6) ──────────────────────────────────
+  const [doubtExplanation, setDoubtExplanation] = useState<string | null>(null);
+
+  const handleResolveDoubt = useCallback(async (userQuery: string) => {
+    // 1. Pause assessment, keep exact activeQuestionIdx and userAnswer intact
+    if (listening) {
+      speechControllerRef.current?.stop();
+      setListening(false);
+    }
+    stopSpeaking();
+
+    const standardDef = activeQuestion.standardConcept;
+    const prompt = `The user is answering assessment question: "${activeQuestion.question}". They have a doubt/question: "${userQuery}". Please provide a helpful, concise clarification to resolve their doubt without giving away the entire answer, then encourage them to resume answering.`;
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const reply = data.reply || "Let me clarify this question for you.";
+        setDoubtExplanation(reply);
+        speakText(reply, {
+          lang: "en-US",
+          onEnd: () => {
+            // Smoothly return to exact pending question
+            speakText(`Whenever you're ready, please continue your answer to: ${activeQuestion.question}`, { lang: "en-US" });
+          },
+        });
+      }
+    } catch {
+      const fallback = `Here is a clarification on ${standardDef.title}: ${standardDef.definition}. You can continue answering the question whenever you're ready.`;
+      setDoubtExplanation(fallback);
+      speakText(fallback, { lang: "en-US" });
+    }
+  }, [activeQuestion, listening]);
+
+  useEffect(() => {
+    const handleDoubtEvent = (e: Event) => {
+      const custom = e as CustomEvent<{ query: string }>;
+      if (custom.detail?.query) {
+        void handleResolveDoubt(custom.detail.query);
+      }
+    };
+    window.addEventListener("careerforge:practice-doubt", handleDoubtEvent);
+    return () => window.removeEventListener("careerforge:practice-doubt", handleDoubtEvent);
+  }, [handleResolveDoubt]);
 
   // Vocalize Question Text
   const handleReadQuestion = () => {
@@ -840,19 +892,19 @@ export function PracticeHub() {
       </h4>
       <div className="grid gap-4 sm:grid-cols-3">
         {externalPracticeTools.map((tool) => (
-          <a key={tool.name} href={tool.url} target="_blank" rel="noopener noreferrer">
-            <Card className="h-full transition-colors hover:border-ink">
-              <p className="text-xs font-medium uppercase tracking-wide text-graphite">
-                {tool.role}
-              </p>
-              <p className="mt-2 font-display text-xl italic text-ink">{tool.name}</p>
-              <p className="mt-2 text-xs leading-relaxed text-graphite">
-                {tool.description}
-              </p>
-              <p className="mt-4 text-xs font-medium text-ink underline decoration-line underline-offset-4">
-                Launch Sandbox →
-              </p>
-            </Card>
+          <a
+            key={tool.name}
+            href={tool.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="block border-2 border-black p-8 transition-colors hover:bg-black hover:text-white"
+          >
+            <p className="text-xs font-medium uppercase tracking-wide">{tool.role}</p>
+            <p className="mt-2 text-xl font-black">{tool.name}</p>
+            <p className="mt-2 text-xs leading-relaxed">{tool.description}</p>
+            <p className="mt-4 text-xs font-black uppercase tracking-widest underline underline-offset-4">
+              Launch Sandbox
+            </p>
           </a>
         ))}
       </div>
